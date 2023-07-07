@@ -110,7 +110,7 @@ func Sign(e *Event, priKey string) error {
 }
 
 var bech32Table = [...]uint8{'q', 'p', 'z', 'r', 'y', '9', 'x', '8', 'g', 'f', '2', 't', 'v', 'd', 'w', '0', 's', '3', 'j', 'n', '5', '4', 'k', 'h', 'c', 'e', '6', 'm', 'u', 'a', '7', 'l'}
-var bench32InverseTable = map[uint8]uint8{
+var bech32InverseTable = map[uint8]uint8{
 	'q': 0,
 	'p': 1,
 	'z': 2,
@@ -146,20 +146,22 @@ var bench32InverseTable = map[uint8]uint8{
 }
 
 func bech32Decode(s string) string {
-	d := extractData(s)
+	data := decodeData(removeHRPAndChecksum(s))
+	return hex.EncodeToString(data)
+}
 
+func decodeData(s string) []uint8 {
 	var buf uint8 = 0
 	bufBits := 0
-	decoded := ""
-
-	for _, c := range d {
-		v := bench32InverseTable[uint8(c)]
+	decoded := []uint8{}
+	for _, c := range s {
+		v := bech32InverseTable[uint8(c)]
 		if bufBits+5 > 8 {
 			n := 8 - bufBits
 			bufBits = 5 - n
 			buf <<= n
 			buf |= (v >> bufBits)
-			decoded += fmt.Sprintf("%02x", buf)
+			decoded = append(decoded, buf)
 			buf = v & ((1 << bufBits) - 1)
 		} else {
 			buf <<= 5
@@ -170,8 +172,90 @@ func bech32Decode(s string) string {
 	return decoded
 }
 
-func extractData(s string) string {
+func removeHRPAndChecksum(s string) string {
 	ss := strings.Split(s, "1")
 	data := ss[len(ss)-1]
 	return data[:len(data)-6]
+}
+
+func bech32Encode(hrp, data string) (string, error) {
+	bs, err := hex.DecodeString(data)
+	if err != nil {
+		return "", err
+	}
+
+	var buf uint16 = 0
+	bufBits := 0
+	values := []uint8{}
+	encoded := ""
+
+	for _, b := range bs {
+		buf <<= 8
+		buf |= uint16(b)
+		bufBits += 8
+		for bufBits >= 5 {
+			v := buf >> (uint16(bufBits) - 5)
+			values = append(values, uint8(v))
+			encoded += string(bech32Table[v])
+			buf &= (1 << (uint16(bufBits) - 5)) - 1
+			bufBits -= 5
+		}
+	}
+	if bufBits != 0 {
+		v := buf << (5 - uint16(bufBits))
+		values = append(values, uint8(v))
+		encoded += string(bech32Table[v])
+	}
+	log.Printf("[DEBUG] encoded: %s", encoded)
+	log.Printf("[DEBUG] checksum: %s", createChecksum(hrp, values))
+
+	return hrp + "1" + encoded + createChecksum(hrp, values), nil
+}
+
+func createChecksum(hrp string, data []uint8) string {
+	values := append(hrpExpand(hrp), data...)
+	log.Printf("[DEBUG] values: %v", values)
+	p := polymod(append(values, 0, 0, 0, 0, 0, 0)) ^ 1
+	checksum := ""
+	for i := 0; i < 6; i++ {
+		v := (p >> (5 * (5 - i))) & 31
+		checksum += string(bech32Table[uint8(v)])
+	}
+	return checksum
+}
+
+func hrpExpand(hrp string) []uint8 {
+	r := make([]uint8, 0, len(hrp)*2+1)
+	for _, x := range hrp {
+		r = append(r, uint8(x)>>5)
+	}
+	r = append(r, 0)
+	for _, x := range hrp {
+		r = append(r, uint8(x)&31)
+	}
+	return r
+}
+
+var GEN = [...]uint32{0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3}
+
+func polymod(values []uint8) uint32 {
+	var chk uint32 = 1
+	for _, v := range values {
+		b := chk >> 25
+		chk = ((chk & 0x1ffffff) << 5) ^ uint32(v)
+		for i := 0; i < 5; i++ {
+			if ((b >> i) & 1) != 0 {
+				chk ^= GEN[i]
+			}
+		}
+	}
+	return chk
+}
+
+func verifyChecksum(hrp, data string) bool {
+	converted := make([]uint8, len(data))
+	for i := range data {
+		converted[i] = bech32InverseTable[data[i]]
+	}
+	return polymod(append(hrpExpand(hrp), converted...)) == 1
 }
